@@ -27,6 +27,46 @@ from shapely.ops import linemerge, unary_union, nearest_points
 from shapely import wkt
 from shapely.validation import make_valid, explain_validity
 
+# -- Блок дефолтных параметров (ЕДИНОЕ МЕСТО ДЛЯ НАСТРОЕК) --
+DEFAULTS = {
+    'DENSITY': 1.0,           # meters
+    'SIMPLIFY': 0.1,         # meters
+    'SIMPLIFY_MIN': 0.0,
+    'SIMPLIFY_MAX': 10.0,
+    'DENSITY_MIN': 0.01,
+    'DENSITY_MAX': 100.0,
+    'SKELETON_DEFAULT': 1,   # Главная ось
+    'SPLIT_AT_JUNCTIONS': False,
+    'CONNECT_FEATURES': False,
+    'FIX_GEOMETRIES': True
+}
+
+# -- ЗАЩИТА ОТ ОТСУТСТВИЯ ЗАВИСИМОСТЕЙ --
+missing_dependencies = []
+try:
+    import numpy as np
+except ImportError:
+    np = None
+    missing_dependencies.append('numpy')
+try:
+    from scipy.spatial import Voronoi
+except ImportError:
+    Voronoi = None
+    missing_dependencies.append('scipy (scipy.spatial.Voronoi)')
+try:
+    from shapely.geometry import (Polygon, MultiPolygon, LineString, MultiLineString, Point)
+    from shapely.ops import linemerge, unary_union, nearest_points
+    from shapely import wkt
+    from shapely.validation import make_valid, explain_validity
+except ImportError:
+    Polygon = None
+    MultiPolygon = None
+    LineString = None
+    MultiLineString = None
+    Point = None
+    linemerge = unary_union = nearest_points = wkt = make_valid = explain_validity = None
+    missing_dependencies.append('shapely')
+
 class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
     INPUT = 'INPUT'
     OUTPUT = 'OUTPUT'
@@ -74,6 +114,10 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
         """)
 
     def initAlgorithm(self, config=None):
+        """
+        Инициализация параметров QGIS Processing Algorithm.
+        Все диапазоны и дефолтные значения берутся из DEFAULTS.
+        """
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT,
@@ -107,7 +151,7 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterBoolean(
                 self.FIX_GEOMETRIES,
                 self.tr('Автоматически исправлять некорректные геометрии'),
-                defaultValue=True
+                defaultValue=DEFAULTS['FIX_GEOMETRIES']
             )
         )
 
@@ -121,7 +165,7 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
                     self.tr('Главная ось (от торца до торца)'),
                     self.tr('Только самая длинная линия')
                 ],
-                defaultValue=1,  # Главная ось
+                defaultValue=DEFAULTS['SKELETON_DEFAULT'],  # Главная ось
                 optional=False
             )
         )
@@ -131,9 +175,9 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
                 self.DENSITY,
                 self.tr('Плотность дискретизации границы (метры)'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=1.0,
-                minValue=0.01,
-                maxValue=100.0
+                defaultValue=DEFAULTS['DENSITY'],
+                minValue=DEFAULTS['DENSITY_MIN'],
+                maxValue=DEFAULTS['DENSITY_MAX']
             )
         )
 
@@ -142,9 +186,9 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
                 self.SIMPLIFY,
                 self.tr('Допуск упрощения (0 = без упрощения)'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.1,
-                minValue=0.0,
-                maxValue=10.0
+                defaultValue=DEFAULTS['SIMPLIFY'],
+                minValue=DEFAULTS['SIMPLIFY_MIN'],
+                maxValue=DEFAULTS['SIMPLIFY_MAX']
             )
         )
 
@@ -152,7 +196,7 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterBoolean(
                 self.CONNECT_FEATURES,
                 self.tr('Соединять касающиеся полигоны'),
-                defaultValue=False
+                defaultValue=DEFAULTS['CONNECT_FEATURES']
             )
         )
 
@@ -160,7 +204,7 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterBoolean(
                 self.SPLIT_AT_JUNCTIONS,
                 self.tr('Разделять на сегменты в точках пересечения'),
-                defaultValue=False  # Для главной оси лучше False
+                defaultValue=DEFAULTS['SPLIT_AT_JUNCTIONS']  # Для главной оси лучше False
             )
         )
 
@@ -172,7 +216,12 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
         )
 
     def densify_boundary(self, polygon, density):
-        """Дискретизация границы полигона"""
+        """
+        Дискретизация границы полигона равномерно, чтобы подготовить вход к Voronoi.
+        :param polygon: Объект shapely Polygon
+        :param density: Шаг в метрах между точками
+        :return: np.array точек по периметру
+        """
         coords = []
         boundary = polygon.boundary
         
@@ -202,7 +251,12 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
         return np.array(list(dict.fromkeys(coords)))
 
     def create_centerline_voronoi(self, polygon, density):
-        """Создание centerline через Voronoi диаграмму"""
+        """
+        Строит центрлайн как медиальную ось с помощью Voronoi диаграммы для точек границы полигона.
+        :param polygon: shapely Polygon
+        :param density: float, шаг дискретизации
+        :return: LineString или MultiLineString (shapely)
+        """
         try:
             points = self.densify_boundary(polygon, density)
             
@@ -231,7 +285,13 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(f'Ошибка Voronoi: {str(e)}')
 
     def simplify_skeleton_to_main_path(self, centerline, polygon, feedback=None):
-        """Упрощение скелета до главного пути (от торца до торца)"""
+        """
+        Пытается выбрать главную ветвь медиальной оси и объединить фрагменты,
+        чтобы получить максимально длинную и непрерывную ось.
+        :param centerline: LineString/MultiLineString (shapely)
+        :param polygon: исходный полигон для mask
+        :return: LineString
+        """
         try:
             # Если это одна линия - возвращаем как есть
             if centerline.geom_type == 'LineString':
@@ -318,7 +378,10 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
         return LineString(main_coords)
 
     def extend_to_boundaries(self, centerline, polygon, feedback=None):
-        """Продление концов линии до границ полигона"""
+        """
+        Экстраполирует (продлевает) начало и конец линии до ближайшей кромки (границы) полигона.
+        :return: LineString c новыми координатами концов
+        """
         try:
             if centerline.geom_type != 'LineString':
                 return centerline
@@ -410,7 +473,10 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
         return [geom]
 
     def fix_geometry(self, shapely_geom, feature_id, feedback):
-        """Исправление некорректной геометрии"""
+        """
+        Исправление самопересечений и иных ошибок геометрии через make_valid.
+        :return: Исправленный shapely Polygon или None
+        """
         try:
             if not shapely_geom.is_valid:
                 reason = explain_validity(shapely_geom)
@@ -462,6 +528,21 @@ class PolygonCenterlineAlgorithm(QgsProcessingAlgorithm):
         return unique_vals
 
     def processAlgorithm(self, parameters, context, feedback):
+        """
+        Основная логика обработки: для каждого (мульти)полигона строит центрлайн методом Voronoi,
+        корректирует геометрию и пишет результат в sink. Для больших данных использует итераторы,
+        избегает хранения больших списков в памяти. Логирует ошибки отсутствия зависимостей.
+        """
+        # Проверка зависимостей
+        if missing_dependencies:
+            deps = ', '.join(missing_dependencies)
+            feedback.reportError(
+                'ВНИМАНИЕ: Для работы алгоритма не хватает зависимостей: ' + deps +\
+                '\n\nУстановите их в окружение QGIS (OSGeo4W или через pip).')
+            raise QgsProcessingException('Отсутствуют зависимости: ' + deps)
+        if np is None or Voronoi is None or Polygon is None:
+            raise QgsProcessingException('Ошибка инициализации зависимостей numpy/scipy/shapely')
+        
         source = self.parameterAsSource(parameters, self.INPUT, context)
         density = self.parameterAsDouble(parameters, self.DENSITY, context)
         simplify = self.parameterAsDouble(parameters, self.SIMPLIFY, context)
